@@ -1,4 +1,4 @@
-# Swift WebSockets Client
+# PieSocket Realtime Swift SDK
 
 PieSocket Realtime SDK for WebSockets written in Swift.
 Supports cross-platform Xcode projects for:  iOS, iPad, Mac, etc.
