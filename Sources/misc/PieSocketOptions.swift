@@ -20,7 +20,9 @@ public class PieSocketOptions{
     private var userId: String
     private var version: String
     private var webSocketEndpoint: String
-    
+    private var clusterDomain: String?
+    private var ssl: Bool
+
     public init(){
         apiKey = ""
         clusterId = ""
@@ -34,6 +36,8 @@ public class PieSocketOptions{
         userId = ""
         version = "3"
         webSocketEndpoint = ""
+        clusterDomain = nil
+        ssl = true
     }
     
     public func getApiKey() -> String {
@@ -84,6 +88,14 @@ public class PieSocketOptions{
         return webSocketEndpoint
     }
 
+    public func getClusterDomain() -> String? {
+        return clusterDomain
+    }
+
+    public func getSsl() -> Bool {
+        return ssl
+    }
+
     public func setApiKey(apiKey: String) {
         return self.apiKey = apiKey
     }
@@ -131,5 +143,13 @@ public class PieSocketOptions{
     func setWebSocketEndpoint(webSocketEndpoint: String) {
         return self.webSocketEndpoint = webSocketEndpoint
     }
-    
+
+    public func setClusterDomain(clusterDomain: String?) {
+        self.clusterDomain = clusterDomain
+    }
+
+    public func setSsl(ssl: Bool) {
+        self.ssl = ssl
+    }
+
 }

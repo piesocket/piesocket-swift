@@ -150,7 +150,9 @@ public class Channel{
             return self.options.getWebSocketEndpoint()
         }
         
-        var endpoint: String = "wss://" + self.options.getClusterId() + ".piesocket.com/v" + self.options.getVersion() + "/" + self.id + "?api_key=" + self.options.getApiKey() + "&notify_self=" + String(self.options.getNotifySelf()) + "&source=swiftskd&v=1&presence="+String(self.options.getPresence());
+        let domain = self.options.getClusterDomain() ?? (self.options.getClusterId() + ".piesocket.com")
+        let scheme = self.options.getSsl() ? "wss" : "ws"
+        var endpoint: String = scheme + "://" + domain + "/v" + self.options.getVersion() + "/" + self.id + "?api_key=" + self.options.getApiKey() + "&notify_self=" + String(self.options.getNotifySelf()) + "&source=swiftskd&v=1&presence="+String(self.options.getPresence());
         
         //Append JWT
         let jwt: String = try getAuthToken()
