@@ -29,9 +29,8 @@ let channel: Channel = piesocket.join(roomId: "chat-room");
 ```
 
 ### Self-hosted PieSocket Server
-Use following code to create a Channel with Managed PieSocket Server.
+Use the following code to create a Channel with a self-hosted PieSocket Server.
 
-Get your API key and Cluster ID here: [Get API Key](https://www.piehost.com/app/v4/register)
 
 ```dart
 let options: PieSocketOptions = PieSocketOptions();
