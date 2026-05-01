@@ -8,7 +8,7 @@ Supports cross-platform Xcode projects for:  iOS, iPad, Mac, etc.
 Simply import this github repository into your Xcode project.
 
  - In your Xcode project, go to File > Add packages
- - Enter `https://github.com/piesocket/websocket-swift-client` in the search box
+ - Enter `https://github.com/piesocket/piesocket-swift` in the search box
  - Click "Add package"
 
 
