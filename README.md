@@ -53,8 +53,6 @@ let channel: Channel = piesocket.join(roomId: "chat-room");
   - Authentication
   - Upto 60% cost savings
 
-We highly recommend using PieSocket Channels over self hosted WebSocket servers for production applications.
-
 ## Events
 `system:connected` is the event fired when WebSocket connection is ready, get a full list system messages here: [PieSocket System Messages](https://piehost.com/docs/3.0/events#system-events)
 
