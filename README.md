@@ -1,4 +1,4 @@
-# Swift WebSockets Client
+# PieSocket Realtime Swift SDK
 
 PieSocket Realtime SDK for WebSockets written in Swift.
 Supports cross-platform Xcode projects for:  iOS, iPad, Mac, etc.
@@ -29,9 +29,8 @@ let channel: Channel = piesocket.join(roomId: "chat-room");
 ```
 
 ### Self-hosted PieSocket Server
-Use following code to create a Channel with Managed PieSocket Server.
+Use the following code to create a Channel with a self-hosted PieSocket Server.
 
-Get your API key and Cluster ID here: [Get API Key](https://www.piehost.com/app/v4/register)
 
 ```dart
 let options: PieSocketOptions = PieSocketOptions();
@@ -54,7 +53,6 @@ let channel: Channel = piesocket.join(roomId: "chat-room");
   - Authentication
   - Upto 60% cost savings
 
-We highly recommend using PieSocket Channels over self hosted WebSocket servers for production applications.
 
 ## v4 — multi-channel over one connection
 
