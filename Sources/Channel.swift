@@ -7,389 +7,428 @@
 import Foundation
 import Starscream
 
-public class Channel{
-    
+public class Channel {
+
     private static var NORMAL_CLOSURE_STATUS: UInt16 = 1000
 
-    private var id: String
+    public private(set) var id: String
     private var ws: WebSocket?
-    private var uuid: String
-    
-    private var listeners: [String: [String: (PieSocketEvent)->Void]]
+    public private(set) var uuid: String
+
+    /// Set when this handle rides a shared v4 `Connection` instead of owning its
+    /// own socket. `ws` is unused in that mode.
+    var hub: Connection?
+
+    /// True for any multiplexed instance, even before `hub` is attached (a
+    /// guarded primary/secondary sits with `hub == nil` while its authEndpoint
+    /// fetch is in flight).
+    private var isMultiplexed = false
+
+    /// Control-frame params replayed by `Connection` across a reconnect — only
+    /// meaningful for a secondary (non-primary) multiplexed channel.
+    var subscribeParams: [String: Any]?
+
+    /// Set when this is a PieRTC (WebRTC) room — v4 only.
+    public var pieRTC: PieRTC?
+
+    private var listeners: [String: [String: (PieSocketEvent) -> Void]]
     private var logger: Logger
     private var options: PieSocketOptions
-    private var members: [AnyObject?]
+    private var members: [Any?]
     private var shouldReconnect: Bool
 
-    
-    
-    public init(roomId: String, options: PieSocketOptions, logger: Logger){
-
-        self.listeners = [String: [String: (PieSocketEvent)->Void]]()
+    public init(roomId: String, options: PieSocketOptions, logger: Logger) {
+        self.listeners = [String: [String: (PieSocketEvent) -> Void]]()
         self.id = roomId
         self.logger = logger
         self.options = options
         self.uuid = UUID().uuidString
         self.shouldReconnect = false
-        self.members = [AnyObject?]()
-        
+        self.members = [Any?]()
+
         try! self.connect()
     }
-    
-    public init(webSocketURL: String, enabledLogs: Bool){
-        
-        self.listeners = [String: [String: (PieSocketEvent)->Void]]()
+
+    public init(webSocketURL: String, enabledLogs: Bool) {
+        self.listeners = [String: [String: (PieSocketEvent) -> Void]]()
         self.id = "standalone"
         self.logger = Logger(enabled: enabledLogs)
         self.options = PieSocketOptions()
-
         self.options.setWebSocketEndpoint(webSocketEndpoint: webSocketURL)
-
         self.uuid = UUID().uuidString
         self.shouldReconnect = false
-        self.members = [AnyObject?]()
+        self.members = [Any?]()
 
         try! self.connect()
     }
-    
-    private func isGuarded() -> Bool {
-        if(self.options.getForceAuth()){
-            return true;
-        }
 
-        return self.id.starts(with: "private-");
+    /// A v4 handle sharing `hub`'s socket instead of opening its own. The
+    /// primary channel is live immediately; secondary channels become live once
+    /// their `system::subscribe` control frame is acked.
+    init(multiplexedRoomId: String, options: PieSocketOptions, logger: Logger, hub: Connection?) {
+        self.listeners = [String: [String: (PieSocketEvent) -> Void]]()
+        self.id = multiplexedRoomId
+        self.logger = logger
+        self.options = options
+        self.uuid = UUID().uuidString
+        self.shouldReconnect = false
+        self.members = [Any?]()
+        self.isMultiplexed = true
+        self.hub = hub
     }
-    
-    public func connect() throws{
-        logger.log(text: "Connecting to: "+self.id);
-        
-        do{
-            let endpoint: String = try buildEndpoint()
-            
-            logger.log(text: "WebSocket Endpoint: "+(endpoint));
-        
+
+    // MARK: - Endpoint
+
+    static func buildUrl(channelId: String, options: PieSocketOptions, uuid: String, jwt: String?) -> String {
+        if !options.getWebSocketEndpoint().isEmpty {
+            return options.getWebSocketEndpoint()
+        }
+        let domain = options.getClusterDomain() ?? (options.getClusterId() + ".piesocket.com")
+        let scheme = options.getSsl() ? "wss" : "ws"
+        var endpoint = scheme + "://" + domain + "/v" + options.getVersion() + "/" + channelId
+            + "?api_key=" + options.getApiKey()
+            + "&notify_self=" + String(options.getNotifySelf())
+            + "&source=swiftsdk&v=1&presence=" + String(options.getPresence())
+
+        if let jwt = jwt, !jwt.isEmpty { endpoint += "&jwt=" + jwt }
+        let userId = options.getUserId()
+        if !userId.isEmpty { endpoint += "&user=" + userId }
+        endpoint += "&uuid=" + uuid
+        return endpoint
+    }
+
+    private func isGuarded() -> Bool {
+        if options.getForceAuth() { return true }
+        return id.starts(with: "private-")
+    }
+
+    private func buildEndpoint() throws -> String {
+        Channel.buildUrl(channelId: id, options: options, uuid: uuid, jwt: try getAuthToken())
+    }
+
+    private func getAuthToken() throws -> String {
+        if !options.getJwt().isEmpty { return options.getJwt() }
+        if isGuarded() {
+            if !options.getAuthEndpoint().isEmpty {
+                getAuthTokenFromServer()
+                throw PieSocketException.PausedForFetchingJwt
+            } else {
+                throw PieSocketException.NeitherJwtNorAuthEndpointFound
+            }
+        }
+        return ""
+    }
+
+    // MARK: - v3 socket
+
+    public func connect() throws {
+        logger.log(text: "Connecting to: " + id)
+        do {
+            let endpoint = try buildEndpoint()
+            logger.log(text: "WebSocket Endpoint: " + endpoint)
             var request = URLRequest(url: URL(string: endpoint)!)
             request.timeoutInterval = 5
             ws = WebSocket(request: request)
             ws?.connect()
             ws?.onEvent = { event in
                 switch event {
-                    case .connected(_):
-                        self.onOpen()
-                    case .disconnected(let reason, let code):
-                        self.onClosing()
-                    case .text(let text):
-                        self.onMessage(text: text)
-                    case .cancelled:
-                        self.onClosing()
-                    case .error(let error):
-                        self.onError(error: error!)
-                    case .binary(_): break
-                    case .pong(_): break
-                    case .ping(_): break
-                    case .viabilityChanged(_): break
-                    case .reconnectSuggested(_): break
-                    @unknown default:
-                        break
+                case .connected: self.onOpen()
+                case .disconnected: self.onClosing()
+                case .text(let text): self.onMessage(text: text)
+                case .cancelled: self.onClosing()
+                case .error(let error): self.onError(error: error)
+                default: break
                 }
             }
-        }catch PieSocketException.PausedForFetchingJwt{
+        } catch PieSocketException.PausedForFetchingJwt {
             logger.log(text: "JWT not provided, will fetch from authEndpoint.")
-        }catch PieSocketException.NeitherJwtNorAuthEndpointFound{
+        } catch PieSocketException.NeitherJwtNorAuthEndpointFound {
             throw PieSocketException.NeitherJwtNorAuthEndpointFound
         }
-
-
-    }
-    
-    public func reconnect(){
-        if(self.shouldReconnect){
-            try! self.connect()
-        }
-    }
-    
-    public func listen(eventName: String, callback: @escaping (PieSocketEvent)->Void) -> String{
-        var callbacks: [String: (PieSocketEvent)->Void];
-        
-        if(self.listeners.keys.contains(eventName)){
-            callbacks = self.listeners[eventName]!
-        }else{
-            callbacks = [String: (PieSocketEvent)->Void]()
-        }
-        
-        let callbackId: String = UUID().uuidString
-        callbacks[callbackId] = callback
-
-        listeners[eventName] = callbacks;
-        
-        return callbackId;
-    }
-    
-    public func publish(event: PieSocketEvent){
-        self.ws?.write(string: event.toString())
     }
 
-    public func send(text: String){
-        self.ws?.write(string: text)
-    }
-
-    
-    public func removeListener(eventName: String, callbackId: String){
-        
-        if(self.listeners.keys.contains(eventName)){
-            self.listeners[eventName]?.removeValue(forKey: callbackId);
-        }
-    }
-    
-    public func removeAllListeners(eventName: String){
-        if(self.listeners.keys.contains(eventName)){
-            self.listeners.removeValue(forKey: eventName)
-        }
-    }
-    
-    private func buildEndpoint() throws -> String{
-        if(!self.options.getWebSocketEndpoint().isEmpty){
-            return self.options.getWebSocketEndpoint()
-        }
-        
-        let domain = self.options.getClusterDomain() ?? (self.options.getClusterId() + ".piesocket.com")
-        let scheme = self.options.getSsl() ? "wss" : "ws"
-        var endpoint: String = scheme + "://" + domain + "/v" + self.options.getVersion() + "/" + self.id + "?api_key=" + self.options.getApiKey() + "&notify_self=" + String(self.options.getNotifySelf()) + "&source=swiftskd&v=1&presence="+String(self.options.getPresence());
-        
-        //Append JWT
-        let jwt: String = try getAuthToken()
-        if(!jwt.isEmpty){
-            endpoint = endpoint+"&jwt="+jwt
-        }
-
-        
-        //Apend UserID
-        let userId: String = options.getUserId()
-        if(!userId.isEmpty){
-            endpoint = endpoint+"&user="+userId
-        }
-        
-        //Append UUID
-        endpoint = endpoint + "&uuid=" + self.uuid
-        
-        return endpoint
-    }
-    
-    private func getAuthToken() throws -> String {
-        
-        if(!options.getJwt().isEmpty){
-            return options.getJwt()
-        }
-        
-        if(self.isGuarded()){
-            
-            if(!self.options.getAuthEndpoint().isEmpty){
-                getAuthTokenFromServer()
-                throw PieSocketException.PausedForFetchingJwt
-            }else{
-                throw PieSocketException.NeitherJwtNorAuthEndpointFound
-            }
-        }
-        return ""
-    }
-    
     private func getAuthTokenFromServer() {
-            
-      let parameters: [String: Any] = ["id": 13, "name": "jack"]
-      let url = URL(string: self.options.getAuthEndpoint())! // change server url accordingly
-      
-      let session = URLSession.shared
-      var request = URLRequest(url: url)
-      request.httpMethod = "POST"
+        guard let url = URL(string: options.getAuthEndpoint()) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        options.getAuthHeaders().forEach { key, val in request.addValue(val, forHTTPHeaderField: key) }
+        request.httpBody = try? JSONSerialization.data(
+            withJSONObject: ["channel_name": id, "connection_uuid": uuid])
 
-      //Add headers
-      self.options.getAuthHeaders().forEach{ key, val in
-         request.addValue(val , forHTTPHeaderField: key)
-      }
-      
-      do {
-        // convert parameters to Data and assign dictionary to httpBody of request
-        request.httpBody = try JSONSerialization.data(withJSONObject: parameters, options: .prettyPrinted)
-      } catch let error {
-        print(error.localizedDescription)
-        return
-      }
-      
-      // create dataTask using the session object to send data to the server
-      let task = session.dataTask(with: request) { data, response, error in
-        
-        if let error = error {
-            self.logger.log(text: "Post Request Error: \(error.localizedDescription)")
-          return
-        }
-    
-        
-        // ensure there is data returned
-        guard let responseData = data else {
-            self.logger.log(text: "nil Data received from the server")
-          return
-        }
-        
-        do {
-          // create json object from data or use JSONDecoder to convert to Model stuct
-          if let jsonResponse = try JSONSerialization.jsonObject(with: responseData, options: .mutableContainers) as? [String: Any] {
-              
-              let jwt: String = jsonResponse["auth"] as! String
-              if(!jwt.isEmpty){
-                  self.options.setJwt(jwt: jwt)
-                  try! self.connect()
-              }else{
-                  self.logger.log(text: "No \"auth\" key found in JSON response from authEndpoint.")
-              }
-              
-          } else {
-            print("data maybe corrupted or in wrong format")
-            throw URLError(.badServerResponse)
-          }
-        } catch let error {
-          print(error.localizedDescription)
-        }
-      }
-      // perform the task
-      task.resume()
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let jwt = json["auth"] as? String, !jwt.isEmpty else {
+                self.logger.log(text: "No \"auth\" key found in authEndpoint response.")
+                return
+            }
+            self.options.setJwt(jwt: jwt)
+            try? self.connect()
+        }.resume()
     }
-        
-    public func disconnect(){
-        self.shouldReconnect = false
-        self.ws?.disconnect(closeCode: Channel.NORMAL_CLOSURE_STATUS)
+
+    public func reconnect() {
+        if shouldReconnect { try? connect() }
     }
-    
-    private func fireEvent(event: PieSocketEvent){
-        logger.log(text: "Firing Event: " + event.getEvent());
-        
-        if(self.listeners.keys.contains(event.getEvent())){
+
+    public func disconnect() {
+        shouldReconnect = false
+
+        if let hub = hub {
+            // A multiplexed secondary channel has no socket of its own.
+            hub.unsubscribeChannel(id) { _ in }
+            hub.detachChannel(id)
+            self.hub = nil
+            return
+        }
+        if isMultiplexed { return }
+        ws?.disconnect(closeCode: Channel.NORMAL_CLOSURE_STATUS)
+    }
+
+    // MARK: - Listeners
+
+    @discardableResult
+    public func listen(eventName: String, callback: @escaping (PieSocketEvent) -> Void) -> String {
+        var callbacks = listeners[eventName] ?? [:]
+        let callbackId = UUID().uuidString
+        callbacks[callbackId] = callback
+        listeners[eventName] = callbacks
+        return callbackId
+    }
+
+    public func removeListener(eventName: String, callbackId: String) {
+        listeners[eventName]?.removeValue(forKey: callbackId)
+    }
+
+    public func removeAllListeners(eventName: String) {
+        listeners.removeValue(forKey: eventName)
+    }
+
+    // MARK: - Outbound
+
+    public func publish(event: PieSocketEvent) {
+        if let hub = hub { hub.send(id, event); return }
+        if isMultiplexed {
+            logger.log(text: "Channel \"\(id)\" is not connected yet — authEndpoint fetch in flight.")
+            return
+        }
+        ws?.write(string: event.toString())
+    }
+
+    public func send(text: String) {
+        if let hub = hub { hub.sendRaw(id, text); return }
+        if isMultiplexed {
+            logger.log(text: "Channel \"\(id)\" is not connected yet — authEndpoint fetch in flight.")
+            return
+        }
+        ws?.write(string: text)
+    }
+
+    /// Publish a structured payload directly, without pre-stringifying it into a
+    /// `PieSocketEvent`. `data`/`meta` may be a dictionary, array, or primitive.
+    public func publishEvent(_ eventName: String, data: Any? = nil, meta: Any? = nil) {
+        var frame: [String: Any] = ["event": eventName]
+        if let data = data { frame["data"] = data }
+        if let meta = meta { frame["meta"] = meta }
+        guard let encoded = Connection.encode(frame) else {
+            logger.log(text: "PieSocket: publishEvent encode failed")
+            return
+        }
+        send(text: encoded)
+    }
+
+    /// Send a raw binary WebSocket frame (v4). The server wraps any inbound
+    /// binary frame as a `system::binary` event (base64 `data`) before relaying
+    /// it, so a browser/Flutter/Android peer receives this exactly as it would a
+    /// binary frame from another client. Primary channel only.
+    public func sendBinary(_ data: Data) throws {
+        if let hub = hub { try hub.sendBinary(id, data); return }
+        if isMultiplexed {
+            throw PieSocketException.ChannelNotReady(
+                "Channel \"\(id)\" is not connected yet — its authEndpoint fetch is still in flight.")
+        }
+        ws?.write(data: data)
+    }
+
+    /// Re-sync this channel's presence roster from the server (v4 only) via
+    /// `system::get_members`. On v3 returns the roster already held.
+    public func refreshMembers(completion: @escaping ([Any?]) -> Void) {
+        if let hub = hub {
+            hub.requestMembers(id) { result in
+                switch result {
+                case .success(let members): completion(members)
+                case .failure: completion(self.members)
+                }
+            }
+            return
+        }
+        completion(members)
+    }
+
+    // MARK: - Event dispatch
+
+    func fireEvent(event: PieSocketEvent) {
+        logger.log(text: "Firing Event: " + event.getEvent())
+        if listeners.keys.contains(event.getEvent()) {
             doFireEvents(listnerKey: event.getEvent(), event: event)
         }
-        
-        if(self.listeners.keys.contains("*")){
+        if listeners.keys.contains("*") {
             doFireEvents(listnerKey: "*", event: event)
         }
     }
 
-    public func doFireEvents(listnerKey: String, event: PieSocketEvent){
-        let callbacks: [String: (PieSocketEvent)->Void] = self.listeners[listnerKey]!
-        
-        callbacks.forEach{ callbackId, callback in
-            callback(event)
-        }
+    private func doFireEvents(listnerKey: String, event: PieSocketEvent) {
+        guard let callbacks = listeners[listnerKey] else { return }
+        for (_, callback) in callbacks { callback(event) }
     }
 
-    public func getMemberByUUID(uuid: String) -> AnyObject?{
-        var res: AnyObject?
-        self.members.forEach{ member in
-            if(member?["uuid"] as! String == uuid){
-                res = member
-            }
-        }
-        return res
-    }
-    
-    public func getCurrentMember() -> AnyObject? {
-        return self.getMemberByUUID(uuid: self.uuid);
+    // MARK: - Inbound
+
+    /// Called by `Connection` for a frame routed to this channel.
+    func handleFromHub(text: String) { onMessage(text: text) }
+
+    /// Called by `Connection` when the shared socket opens (primary only).
+    func handleOpenFromHub() { onOpen() }
+
+    private func onOpen() {
+        fireEvent(event: PieSocketEvent(event: "system:connected"))
+        shouldReconnect = true
     }
 
-    public func getAllMembers() -> [AnyObject?]{
-        return self.members
+    private func onClosing() {
+        fireEvent(event: PieSocketEvent(event: "system:closed"))
+        reconnect()
     }
-    
-    //WebSocket handlers
-    private func onOpen(){
 
-        let event: PieSocketEvent = PieSocketEvent(event: "system:connected");
-        self.fireEvent(event: event);
-
-        self.shouldReconnect = true;
-
+    private func onError(error: Error?) {
+        let event = PieSocketEvent(event: "system:error")
+        event.setData(data: error?.localizedDescription ?? "error")
+        fireEvent(event: event)
     }
-        
-    private func onClosing(){
-        let event: PieSocketEvent = PieSocketEvent(event: "system:closed");
-        self.fireEvent(event: event);
 
-        self.reconnect()
+    private func convertStringToDictionary(text: String) -> [String: Any]? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
-    
-    private func onError(error: any Error){
-        let event: PieSocketEvent = PieSocketEvent(event: "system:error");
-        self.fireEvent(event: event);
-    }
-    
-    
-    private func convertStringToDictionary(text: String) -> [String:AnyObject]? {
-        if let data: Data = text.data(using: .utf8) {
-           do {
-               let json = try JSONSerialization.jsonObject(with: data, options: .mutableContainers) as? [String:AnyObject]
-               return json
-           } catch {
-               return nil
-           }
-       }
-       return nil
-   }
 
-    private func dictToString(dict: AnyObject?) -> String{
-        do{
-            let data: Data = try JSONSerialization.data(withJSONObject: dict as Any, options: .fragmentsAllowed)
-            return String(data: data, encoding: .utf8) ?? ""
-        }catch{
+    private func dictToString(_ value: Any?) -> String {
+        guard let value = value else { return "" }
+        if let s = value as? String { return s }
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed) else {
             return ""
         }
+        return String(data: data, encoding: .utf8) ?? ""
     }
-    
-    private func onMessage(text: String){
-        
-        var payload: PieSocketEvent = PieSocketEvent();
-        
-        if (self.listeners.keys.contains("system:message")) {
-            payload.setEvent(event: "system:message");
-            payload.setData(data: text);
 
-            doFireEvents(listnerKey: "system:message", event: payload);
+    private func onMessage(text: String) {
+        if listeners.keys.contains("system:message") {
+            let payload = PieSocketEvent(event: "system:message")
+            payload.setData(data: text)
+            doFireEvents(listnerKey: "system:message", event: payload)
         }
 
-        
-        //Fire json events
-        let jsonObject = convertStringToDictionary(text: text)
-        
-        if(jsonObject != nil){
-            
-            if(jsonObject?.keys.contains("event") ?? false ){
-                payload.setEvent(event: jsonObject?["event"] as! String)
-                payload.setData(data: dictToString(dict: jsonObject?["data"]));
-                payload.setMeta(meta: dictToString(dict: jsonObject?["meta"]))
+        guard let jsonObject = convertStringToDictionary(text: text) else { return }
 
-                //Trigger listener(s
-                handleSystemEvents(event: payload)
-                fireEvent(event: payload)
+        if let eventName = jsonObject["event"] as? String {
+            if eventName == "system:boot" {
+                onOpen()
+                return
             }
-            
-            if(jsonObject?.keys.contains("error") ?? false ){
-                self.shouldReconnect = false
-                
-                payload.setEvent(event: "system:error")
-                payload.setData(data: dictToString(dict: jsonObject?["error"]))
-                fireEvent(event: payload)
+            let payload = PieSocketEvent(event: eventName)
+            if let data = jsonObject["data"], !(data is NSNull) {
+                payload.setData(data: dictToString(data))
             }
-            
-            
+            if let meta = jsonObject["meta"], !(meta is NSNull) {
+                payload.setMeta(meta: dictToString(meta))
+            }
+
+            handleSystemEvents(event: payload)
+            handlePieRTCEvent(eventName: eventName, data: jsonObject["data"])
+            fireEvent(event: payload)
         }
-        
-    }
-    
-    private func handleSystemEvents(event: PieSocketEvent){
-        if(
-            event.getEvent() == "system:member_list" ||
-            event.getEvent() == "system:member_joined" ||
-            event.getEvent() == "system:member_left"
-        ){
-            let object = convertStringToDictionary(text: event.getData())
-            self.members = object?["members"] as! [AnyObject?]
+
+        if let error = jsonObject["error"] {
+            shouldReconnect = false
+            let payload = PieSocketEvent(event: "system:error")
+            payload.setData(data: dictToString(error))
+            fireEvent(event: payload)
         }
     }
 
+    // MARK: - Presence
+
+    private func handleSystemEvents(event: PieSocketEvent) {
+        let deltaPresence = options.getVersion() == "4"
+        let memberListEvent = deltaPresence ? "system::member_list" : "system:member_list"
+        let memberJoinedEvent = deltaPresence ? "system::member_joined" : "system:member_joined"
+        let memberLeftEvent = deltaPresence ? "system::member_left" : "system:member_left"
+
+        let name = event.getEvent()
+        guard name == memberListEvent || name == memberJoinedEvent || name == memberLeftEvent else { return }
+        guard let data = convertStringToDictionary(text: event.getData()) else { return }
+
+        if name == memberListEvent {
+            members = (data["members"] as? [Any?]) ?? []
+        } else if name == memberJoinedEvent {
+            if deltaPresence { addMember(data["member"]) }
+            else { members = (data["members"] as? [Any?]) ?? [] }
+        } else if name == memberLeftEvent {
+            if deltaPresence { removeMember(data["member"]) }
+            else { members = (data["members"] as? [Any?]) ?? [] }
+            if let member = data["member"] as? [String: Any], let uuid = member["uuid"] as? String {
+                pieRTC?.removeParticipant(uuid: uuid)
+            }
+        }
+    }
+
+    private func memberKey(_ member: Any?) -> String {
+        if let dict = member as? [String: Any] {
+            if let uuid = dict["uuid"] { return "uuid:\(uuid)" }
+            if let data = try? JSONSerialization.data(withJSONObject: dict),
+               let s = String(data: data, encoding: .utf8) {
+                return "obj:\(s)"
+            }
+            return "obj:\(dict)"
+        }
+        return "val:\(String(describing: member))"
+    }
+
+    private func addMember(_ member: Any?) {
+        guard let member = member else { return }
+        let key = memberKey(member)
+        if members.contains(where: { memberKey($0) == key }) { return }
+        members.append(member)
+    }
+
+    private func removeMember(_ member: Any?) {
+        guard let member = member else { return }
+        let key = memberKey(member)
+        members.removeAll { memberKey($0) == key }
+    }
+
+    // MARK: - PieRTC routing
+
+    private func handlePieRTCEvent(eventName: String, data: Any?) {
+        guard let pieRTC = pieRTC, let dict = data as? [String: Any] else { return }
+        pieRTC.handleSignal(eventName: eventName, data: dict)
+    }
+
+    // MARK: - Members accessors
+
+    public func getMemberByUUID(uuid: String) -> [String: Any]? {
+        for member in members {
+            if let dict = member as? [String: Any], dict["uuid"] as? String == uuid {
+                return dict
+            }
+        }
+        return nil
+    }
+
+    public func getCurrentMember() -> [String: Any]? {
+        getMemberByUUID(uuid: uuid)
+    }
+
+    public func getAllMembers() -> [Any?] {
+        members
+    }
 }
